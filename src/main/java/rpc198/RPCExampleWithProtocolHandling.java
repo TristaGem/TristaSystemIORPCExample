@@ -1,4 +1,4 @@
-package rpc196;
+package rpc198;
 
 
 import io.netty.bootstrap.ServerBootstrap;
@@ -205,7 +205,7 @@ interface Car{
     public String ooxx(String msg);
 }
 
-public class TristaRPCTest {
+public class RPCExampleWithProtocolHandling {
 
     public void startServer() {
         NioEventLoopGroup boss = new NioEventLoopGroup(1);
