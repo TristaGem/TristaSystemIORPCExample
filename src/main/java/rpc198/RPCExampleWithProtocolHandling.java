@@ -1,6 +1,7 @@
 package rpc198;
 
 
+import com.sun.xml.internal.bind.v2.runtime.reflect.Lister;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -10,6 +11,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
+import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
@@ -17,6 +19,7 @@ import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
@@ -24,6 +27,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.InetSocketAddress;
+import java.util.List;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -121,7 +125,7 @@ class MyContent implements Serializable {
 //源于 spark 源码
 class ClientFactory {
 
-    int poolSize = 1;
+    int poolSize = 10;
     NioEventLoopGroup clientWorker;
     Random rand = new Random();
 
@@ -209,7 +213,7 @@ public class RPCExampleWithProtocolHandling {
 
     public void startServer() {
         NioEventLoopGroup boss = new NioEventLoopGroup(1);
-        NioEventLoopGroup worker = boss;
+        NioEventLoopGroup worker = new NioEventLoopGroup(50);
 
         ServerBootstrap sbs = new ServerBootstrap();
         ChannelFuture bind = sbs.group(boss, worker)
@@ -219,6 +223,7 @@ public class RPCExampleWithProtocolHandling {
                     protected void initChannel(NioSocketChannel ch) throws Exception {
                         System.out.println("server accept client port " + ch.remoteAddress());
                         ChannelPipeline pipeline = ch.pipeline();
+                        pipeline.addLast(new ServerDecode());
                         pipeline.addLast(new ServerRequestHandler());
                     }
                 }).bind(new InetSocketAddress("127.0.0.1", 9090));
@@ -380,50 +385,178 @@ class ResponseHandler {
 class ServerRequestHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        ByteBuf buf = (ByteBuf) msg;
-        ByteBuf sendBuf = buf.copy();
-        if(buf.readableBytes() >= 85) {
-            byte[] bytes = new byte[85];
-            buf.readBytes(bytes);
-            ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
+        Packmsg requestPkg = (Packmsg) msg;
+        System.out.println("server handler: " + requestPkg.content.methodName + "server arg: " + requestPkg.content.getArgs()[0]);
+
+
+//        ByteBuf sendBuf = buf.copy();
+        /*
+        while(buf.readableBytes() >= 85) {
+            byte[] headerBytes = new byte[85];
+            // 使用getBytes,指定从哪开始读（从读指针开始读），读多少(进哪里)，
+            // ！！！ 不会真的移动读指针
+            buf.getBytes(buf.readerIndex(), headerBytes);
+//            buf.readBytes(headerBytes);
+            ByteArrayInputStream bais = new ByteArrayInputStream(headerBytes);
             ObjectInputStream ois = new ObjectInputStream(bais);
             Myheader myheader = (Myheader) ois.readObject();
             System.out.println("data length from server Request handler: " + myheader.getDataLen());
             System.out.println("request ID from server Request handler: " + myheader.getRequestID());
 
             if(buf.readableBytes() >= myheader.dataLen) {
+                //如果成功进入body段，移动读指针到header尾
+                buf.readBytes(85);
                 byte[] request = new byte[buf.readableBytes()];
                 buf.readBytes(request);
                 bais = new ByteArrayInputStream(request);
                 ois = new ObjectInputStream(bais);
                 MyContent content = (MyContent) ois.readObject();
                 System.out.println("print class name from serverRequestHandler: " + content.getName()+"." + content.getMethodName());
+            } else {
+                System.out.println("channel else: " + buf.readableBytes());
             }
-        }
+        }*/
+        //request header 0x14141414
+        // response header 0x14141424
+        String ioThreadName = Thread.currentThread().getName();
+        //1,直接在当前方法 处理IO和业务和返回
 
-        ChannelFuture channelFuture = ctx.writeAndFlush(sendBuf);
-        channelFuture.sync();
+        //3，自己创建线程池
+        //2,使用netty自己的eventloop来处理业务及返回
+
+        //方法一
+//        ctx.executor().execute(new Runnable() {
+        //丢给别的executor来处理
+        ctx.executor().parent().next().execute(new Runnable() {
+
+            @Override
+            public void run() {
+                String execThreadName = Thread.currentThread().getName();
+                MyContent content = new MyContent();
+                String res = "io thread: " + ioThreadName + " exec thread: " + execThreadName + " from args " + requestPkg.content.getArgs();
+                content.setRes(res);
+
+                System.out.println(res);
+                byte[] contentBytes = SerDerUtil.ser(content);
+
+                Myheader resHeader = new Myheader();
+                resHeader.setRequestID(requestPkg.header.getRequestID());
+                resHeader.setFlag(0x14141424);
+                resHeader.setDataLen(contentBytes.length);
+
+                byte[] headBytes = SerDerUtil.ser(resHeader);
+                PooledByteBufAllocator allocator = PooledByteBufAllocator.DEFAULT;
+                ByteBuf byteBuf = allocator.directBuffer(headBytes.length+contentBytes.length);
+
+                byteBuf.writeBytes(headBytes);
+                byteBuf.writeBytes(contentBytes);
+                ctx.writeAndFlush(byteBuf);
+
+            }
+        });
+
+//        ChannelFuture channelFuture = ctx.writeAndFlush(buf);
+//        channelFuture.sync();
+    }
+}
+
+class ServerDecode extends ByteToMessageDecoder{
+
+    // - 他的父类里有channelread 方法
+    // 把你放在channelRead中的部分，现在可以放在decode函数中。该类会自动在channelRead前后
+    // 为你实现留存和拼接。
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf buf, List<Object> out) throws Exception {
+        while(buf.readableBytes() >= 110) {
+            byte[] bytes = new byte[110];
+            buf.getBytes(buf.readerIndex(),bytes);  //从哪里读取，读多少，但是readindex不变
+            ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+            ObjectInputStream oin = new ObjectInputStream(in);
+            Myheader header = (Myheader) oin.readObject();
+
+
+            //DECODE在2个方向都使用
+            //通信的协议
+            if(buf.readableBytes() >= header.getDataLen()){
+                //处理指针
+                buf.readBytes(85);  //移动指针到body开始的位置
+                byte[] data = new byte[(int)header.getDataLen()];
+                buf.readBytes(data);
+                ByteArrayInputStream din = new ByteArrayInputStream(data);
+                ObjectInputStream doin = new ObjectInputStream(din);
+
+                if(header.getFlag() == 0x14141414){
+                    MyContent content = (MyContent) doin.readObject();
+                    out.add(new Packmsg(header,content));
+
+                }else if(header.getFlag() == 0x14141424){
+                    MyContent content = (MyContent) doin.readObject();
+                    out.add(new Packmsg(header,content));
+                }
+            }else{
+                break;
+            }
+
+
+        }
     }
 }
 
 class ClientResponses  extends ChannelInboundHandlerAdapter {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        ByteBuf buf = (ByteBuf) msg;
-
-        if (buf.readableBytes() >= 85) {
-            byte[] bytes = new byte[85];
-            buf.readBytes(bytes);
-            ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
-            ObjectInputStream ois = new ObjectInputStream(bais);
-            Myheader myheader = (Myheader) ois.readObject();
-            System.out.println("client resoponse @ id: " + myheader.getRequestID());
-            System.out.println("client response's data length is: " + myheader.getDataLen());
-//            System.out.println(myheader.getRequestID());
-
+            Packmsg response = (Packmsg) msg;
             //TODO
-            ResponseHandler.runCallBack(myheader.getRequestID());
+            ResponseHandler.runCallBack(response.header.getRequestID());
 
         }
+    }
+}
+
+class Packmsg {
+
+    Myheader header;
+    MyContent content;
+
+    public Myheader getHeader() {
+        return header;
+    }
+
+    public void setHeader(Myheader header) {
+        this.header = header;
+    }
+
+    public MyContent getContent() {
+        return content;
+    }
+
+    public void setContent(MyContent content) {
+        this.content = content;
+    }
+
+    public Packmsg(Myheader header, MyContent content) {
+        this.header = header;
+        this.content = content;
+    }
+}
+
+class SerDerUtil {
+    static ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+    public synchronized static byte[] ser(Object msg){
+        out.reset();
+        ObjectOutputStream oout = null;
+        byte[] msgBody = null;
+        try {
+            oout = new ObjectOutputStream(out);
+            oout.writeObject(msg);
+            msgBody= out.toByteArray();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return msgBody;
+
+
     }
 }
