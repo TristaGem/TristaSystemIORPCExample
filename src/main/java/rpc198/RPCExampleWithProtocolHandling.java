@@ -1,7 +1,6 @@
 package rpc198;
 
 
-import com.sun.xml.internal.bind.v2.runtime.reflect.Lister;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -15,6 +14,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import org.eclipse.jetty.util.Callback;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
@@ -30,6 +30,7 @@ import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 
@@ -177,7 +178,7 @@ class ClientFactory {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
                         ChannelPipeline p = ch.pipeline();
-//                        p.addLast(new ServerDecode());
+                        p.addLast(new ServerDecode());
                         p.addLast(new ClientResponses());  //解决给谁的？？  requestID..
                     }
                 }).connect(address);
@@ -244,7 +245,8 @@ public class RPCExampleWithProtocolHandling {
         System.out.println("server started\n");
 
         Car car = proxyGet(Car.class);
-        car.ooxx("hello");
+        System.out.println("received responses from client: " + car.ooxx("hello from client "));
+
 
     }
 
@@ -262,7 +264,7 @@ public class RPCExampleWithProtocolHandling {
             final int clientID = i;
             threads[i] = new Thread(() -> {
                 Car car = proxyGet(Car.class);
-                System.out.println(car.ooxx("hello from client " + clientID));
+                System.out.println("received responses from client: " + clientID + " " + car.ooxx("hello from client " + clientID));
             });
         }
 
@@ -326,7 +328,7 @@ public class RPCExampleWithProtocolHandling {
                 //TODO：Server：： dispatcher  Executor
                 byte[] msgHeader = out.toByteArray();
 
-                System.out.println("main:::" + msgHeader.length);
+//                System.out.println("main:::" + msgHeader.length);
 
                 //3，连接池：：取得连接
                 ClientFactory factory = ClientFactory.getFactory();
@@ -336,26 +338,22 @@ public class RPCExampleWithProtocolHandling {
                 //4. send -> IO, out->Netty
                 ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(msgHeader.length + msgBody.length);
 
-                CountDownLatch countDownLatch = new CountDownLatch(1);
+//                CountDownLatch countDownLatch = new CountDownLatch(1);
                 long id = header.getRequestID();
-                ResponseHandler.addCallBack(id, new Runnable() {
-                    @Override
-                    public void run() {
-                        countDownLatch.countDown();
-                    }
-                });
+                CompletableFuture<String> res = new CompletableFuture<>();
+                ResponseHandler.addCallBack(id, res);
 
                 byteBuf.writeBytes(msgHeader);
                 byteBuf.writeBytes(msgBody);
                 System.out.println("start to send request:" + msgHeader);
-                ChannelFuture channelFuture = clientChannel.writeAndFlush(byteBuf);
-                channelFuture.sync(); //blocking here
+//                ChannelFuture channelFuture = clientChannel.writeAndFlush(byteBuf);
+//                channelFuture.sync(); //blocking here
+                clientChannel.writeAndFlush(byteBuf);
 
                 // waiting for the response to come back
-                countDownLatch.await();
 
                 //how to resume code execution from here if the response come back in the future
-                return null;
+                return res.get();
 
             }
         });
@@ -363,15 +361,17 @@ public class RPCExampleWithProtocolHandling {
 }
 
 class ResponseHandler {
-    static ConcurrentHashMap<Long, Runnable> mapping = new ConcurrentHashMap<>();
-    public static void addCallBack(long requestId, Runnable cb) {
+    static ConcurrentHashMap<Long, CompletableFuture> mapping = new ConcurrentHashMap<>();
+    public static void addCallBack(long requestId, CompletableFuture<String> cb) {
         mapping.put(requestId, cb);
     }
 
-    public static void runCallBack(long requestId) {
-        Runnable cb = mapping.get(requestId);
-        if (cb != null) {
-            cb.run();
+    public static void runCallBack(Packmsg msg) {
+        long requestId = msg.header.getRequestID();
+        String result = (String)msg.content.getRes();
+        CompletableFuture<String> cf = mapping.get(requestId);
+        if (cf != null) {
+            cf.complete(result);
             removeCB(requestId);
         }
     }
@@ -433,7 +433,7 @@ class ServerRequestHandler extends ChannelInboundHandlerAdapter {
             public void run() {
                 String execThreadName = Thread.currentThread().getName();
                 MyContent content = new MyContent();
-                String res = "io thread: " + ioThreadName + " exec thread: " + execThreadName + " from args " + requestPkg.content.getArgs();
+                String res = "io thread: " + ioThreadName + " exec thread: " + execThreadName + " from args " + requestPkg.content.getArgs()[0];
                 content.setRes(res);
 
                 System.out.println(res);
@@ -507,9 +507,8 @@ class ClientResponses  extends ChannelInboundHandlerAdapter {
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
             Packmsg response = (Packmsg) msg;
             //TODO
-            ResponseHandler.runCallBack(response.header.getRequestID());
+            ResponseHandler.runCallBack(response);
 
-        }
     }
 }
 
